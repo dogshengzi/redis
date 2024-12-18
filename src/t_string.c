@@ -93,30 +93,41 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
 }
 
 /* SET key value [NX] [XX] [EX <seconds>] [PX <milliseconds>] */
+/* 执行 SET 命令 */
 void setCommand(client *c) {
     int j;
     robj *expire = NULL;
     int unit = UNIT_SECONDS;
     int flags = OBJ_SET_NO_FLAGS;
 
+    // 解析额外的参数，SET命令最少有3个参数，其中参数0是命令名SET，
+    // 参数1是key，参数2是要设置的value，额外参数从参数3开始
     for (j = 3; j < c->argc; j++) {
         char *a = c->argv[j]->ptr;
+        // 保存下一个参数对象，当额外参数是EX/PX时，下一个参数需要
+        // 有超时的具体时间
         robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
 
         if ((a[0] == 'n' || a[0] == 'N') &&
             (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
             !(flags & OBJ_SET_XX))
         {
+	    // 如果额外参数是NX，且没有XX标记时，标记设置OBJ_SET_NX
+	    // 表示只有key不存在时才对key进行set
             flags |= OBJ_SET_NX;
         } else if ((a[0] == 'x' || a[0] == 'X') &&
                    (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
                    !(flags & OBJ_SET_NX))
         {
+	    // 如果额外参数是XX，且没有NX标记时，标记设置OBJ_SET_XX
+	    // 表示只有key存在时才对key进行set
             flags |= OBJ_SET_XX;
         } else if ((a[0] == 'e' || a[0] == 'E') &&
                    (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
                    !(flags & OBJ_SET_PX) && next)
         {
+	    // 如果额外参数是EX，且没有PX标记，且next不为空，标记
+	    // 设置OBJ_SET_EX，表示key有过期时间(expire，单位秒)
             flags |= OBJ_SET_EX;
             unit = UNIT_SECONDS;
             expire = next;
@@ -125,17 +136,21 @@ void setCommand(client *c) {
                    (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
                    !(flags & OBJ_SET_EX) && next)
         {
+	    // 与EX类似，不同之处在于PX的单位是毫秒
             flags |= OBJ_SET_PX;
             unit = UNIT_MILLISECONDS;
             expire = next;
             j++;
         } else {
+            // 否则返回语法错误
             addReply(c,shared.syntaxerr);
             return;
         }
     }
 
+    // 为了节省空间尝试再次编码value
     c->argv[2] = tryObjectEncoding(c->argv[2]);
+    // 执行set命令 
     setGenericCommand(c,flags,c->argv[1],c->argv[2],expire,unit,NULL,NULL);
 }
 
@@ -154,12 +169,16 @@ void psetexCommand(client *c) {
     setGenericCommand(c,OBJ_SET_NO_FLAGS,c->argv[1],c->argv[3],c->argv[2],UNIT_MILLISECONDS,NULL,NULL);
 }
 
+/* 执行通用的 get 命令 */
 int getGenericCommand(client *c) {
     robj *o;
 
+    // 在字典中查找key，如果找到返回value对象，否则返回空
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL)
         return C_OK;
 
+    // 如果get命令查找的value不是字符串对象，则回复错误信息，
+    // 否则编码回复value对象
     if (o->type != OBJ_STRING) {
         addReply(c,shared.wrongtypeerr);
         return C_ERR;
@@ -169,6 +188,7 @@ int getGenericCommand(client *c) {
     }
 }
 
+/* 执行 get 命令 */
 void getCommand(client *c) {
     getGenericCommand(c);
 }

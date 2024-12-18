@@ -88,9 +88,25 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
  * for read operations. Even if the key expiry is master-driven, we can
  * correctly report a key is expired on slaves even if the master is lagging
  * expiring our key via DELs in the replication link. */
+/*
+ * @brief 查找指定db中用于读操作的key，找到则返回key对象，否则返回空
+ * 函数中的额外动作：
+ * 1. 如果查找的key ttl到期，则设置过期
+ * 2. 更新key的最后访问时间
+ * 3. 更新全局key的命中/未命中统计信息
+ *
+ * @param db     db对象指针
+ * @param key    key对象指针
+ * @param flags  LOOCKUP_NONE(未传递标志)/LOOKUP_NOTOUCH(不修改key的最后访问
+ * 		 时间)
+ *
+ * @returns      如果key存在且未过期，返回key对应的value对象
+ *               如果key不存在或已过期，返回空
+ */
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
     robj *val;
 
+    // 过期key处理
     if (expireIfNeeded(db,key) == 1) {
         /* Key expired. If we are in the context of a master, expireIfNeeded()
          * returns 0 only when the key does not exist at all, so it's safe
@@ -117,7 +133,10 @@ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
             return NULL;
         }
     }
+
+    // 查找value并且更新key的访问时间
     val = lookupKey(db,key,flags);
+    // 更新统计信息(命中/未命中)
     if (val == NULL)
         server.stat_keyspace_misses++;
     else
@@ -127,6 +146,7 @@ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
 
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
  * common case. */
+/* 进行不更新访问时间的查找key */
 robj *lookupKeyRead(redisDb *db, robj *key) {
     return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
 }
@@ -141,6 +161,7 @@ robj *lookupKeyWrite(redisDb *db, robj *key) {
     return lookupKey(db,key,LOOKUP_NONE);
 }
 
+/* 查找读取key对应的value，如果找到返回value对象，否则向client回复key不存在 */
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
     robj *o = lookupKeyRead(c->db, key);
     if (!o) addReply(c,reply);

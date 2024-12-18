@@ -162,16 +162,28 @@ client *createClient(int fd) {
  * Typically gets called every time a reply is built, before adding more
  * data to the clients output buffers. If the function returns C_ERR no
  * data should be appended to the output buffers. */
+/*
+ * @brief     用于检测客户端是否可写，如果条件满足，将其加入到待写列表中，等待
+ *            beforeSleep中进行回复操作
+ * @param c   client 对象指针
+ * @returns   条件不满足时，返回C_ERR，表示不应该向client发送消息
+ *            条件满足时，返回C_OK，表示可以向client发送消息
+ */
 int prepareClientToWrite(client *c) {
     /* If it's the Lua client we always return ok without installing any
      * handler since there is no socket at all. */
+    // 如果是LUA或者MODULE环境，直接返回OK，无需添加处理器进行回复，此时
+    // 实际上没有socket
     if (c->flags & (CLIENT_LUA|CLIENT_MODULE)) return C_OK;
 
     /* CLIENT REPLY OFF / SKIP handling: don't send replies. */
+    // 如果client回复关闭或者跳过不处理，不发送回复信息，返回错误
     if (c->flags & (CLIENT_REPLY_OFF|CLIENT_REPLY_SKIP)) return C_ERR;
 
     /* Masters don't receive replies, unless CLIENT_MASTER_FORCE_REPLY flag
      * is set. */
+    // 如果是主备环境，slave无需向master(CLIENT_MASTER)回复数据，除非设置了
+    // CLIENT_MASTER_FORCE_REPLY标记
     if ((c->flags & CLIENT_MASTER) &&
         !(c->flags & CLIENT_MASTER_FORCE_REPLY)) return C_ERR;
 
@@ -181,6 +193,8 @@ int prepareClientToWrite(client *c) {
      * if not already done (there were no pending writes already and the client
      * was yet not flagged), and, for slaves, if the slave can actually
      * receive writes at this stage. */
+    // 如果写处理器未安装，并且对于主备，slave在线且未安装写处理器
+    // 则添加client到clients_pending_write，等待写入(避免这里的系统调用)
     if (!clientHasPendingReplies(c) &&
         !(c->flags & CLIENT_PENDING_WRITE) &&
         (c->replstate == REPL_STATE_NONE ||
@@ -203,19 +217,32 @@ int prepareClientToWrite(client *c) {
 /* -----------------------------------------------------------------------------
  * Low level functions to add more data to output buffers.
  * -------------------------------------------------------------------------- */
-
+/* 
+ * @brief 将回复数据添加到输出缓冲区
+ * @param c    要回复的client
+ * @param s    要回复的消息字符串
+ * @param len  回复的消息长度
+ * @returns    如果添加数据到输出缓冲区成功，返回C_OK
+ *             如果添加数据到输出缓冲区失败，返回C_ERR
+ */
 int _addReplyToBuffer(client *c, const char *s, size_t len) {
+    // 输出缓冲区的有效空间
     size_t available = sizeof(c->buf)-c->bufpos;
 
+    // 如果设置了CLIENT_CLOSE_AFTER_REPLY，说明上一次回复之后，客户端已经
+    // 关闭或者处于将要关闭的状态，不能继续给CLIENT发送消息，直接返回C_OK
     if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return C_OK;
 
     /* If there already are entries in the reply list, we cannot
      * add anything more to the static buffer. */
+    // 如果reply中存在还未发送的回复，不能继续添加回复消息
     if (listLength(c->reply) > 0) return C_ERR;
 
     /* Check that the buffer has enough space available for this string. */
+    // 如果输出缓冲区可用空间不足，返回错误
     if (len > available) return C_ERR;
 
+    // 将要回复的消息拷贝到输出缓冲区，返回C_OK
     memcpy(c->buf+c->bufpos,s,len);
     c->bufpos+=len;
     return C_OK;
@@ -307,17 +334,16 @@ void _addReplyStringToList(client *c, const char *s, size_t len) {
  * Higher level functions to queue data on the client output buffer.
  * The following functions are the ones that commands implementations will call.
  * -------------------------------------------------------------------------- */
-
+/*
+ * 添加回复数据到输出缓冲区
+ */
 void addReply(client *c, robj *obj) {
+    // 客户端检测及client任务队列添加，添加完成后，在beforeSleep时会
+    // 检测到该client上有写任务要完成
     if (prepareClientToWrite(c) != C_OK) return;
 
-    /* This is an important place where we can avoid copy-on-write
-     * when there is a saving child running, avoiding touching the
-     * refcount field of the object if it's not needed.
-     *
-     * If the encoding is RAW and there is room in the static buffer
-     * we'll be able to send the object to the client without
-     * messing with its page. */
+    // 回复只有sds类型和int类型，这里将obj对象进行编码处理，
+    // 使其符合回复格式
     if (sdsEncodedObject(obj)) {
         if (_addReplyToBuffer(c,obj->ptr,sdslen(obj->ptr)) != C_OK)
             _addReplyObjectToList(c,obj);
@@ -546,10 +572,16 @@ void addReplyBulkLen(client *c, robj *obj) {
 }
 
 /* Add a Redis Object as a bulk reply */
+/* 根据obj对象编码回复消息(bulk格式) */
 void addReplyBulk(client *c, robj *obj) {
+    // 先将长度放到输出缓冲区(例如：*3\r\n)
     addReplyBulkLen(c,obj);
+    // 然后放置数据编码的字符串到输出缓冲区(例如：100)
     addReply(c,obj);
+    // 最后放置结束符号\r\n(例如：\r\n)
     addReply(c,shared.crlf);
+
+    // 执行完毕后回复消息编码成功(例如：*3\r\n100\r\n)
 }
 
 /* Add a C buffer as bulk reply */
@@ -1349,6 +1381,13 @@ void processInputBuffer(client *c) {
     server.current_client = NULL;
 }
 
+/*
+ * @brief 可读事件触发回调函数，用于读取客户端发送的查询请求
+ * @param el  事件循环实例指针
+ * @param fd  读取数据的socket连接的文件描述符
+ * @param privdata  私有数据，从socket连接中读取数据时，私有数据为client
+ * @param mask  事件掩码，标识事件类型(AE_(READABLE/WRITABLE))
+ */
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     client *c = (client*) privdata;
     int nread, readlen;
@@ -1356,13 +1395,14 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);
 
+	// 默认输入缓冲区16k
     readlen = PROTO_IOBUF_LEN;
     /* If this is a multi bulk request, and we are processing a bulk reply
      * that is large enough, try to maximize the probability that the query
      * buffer contains exactly the SDS string representing the object, even
      * at the risk of requiring more read(2) calls. This way the function
      * processMultiBulkBuffer() can avoid copying buffers to create the
-     * Redis Object representing the argument. */
+     * Redis Object representing the argument. */ 
     if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1
         && c->bulklen >= PROTO_MBULK_BIG_ARG)
     {
